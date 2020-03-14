@@ -48,6 +48,9 @@ import com.android.wallpaper.R;
 import com.android.wallpaper.asset.Asset;
 import com.android.wallpaper.asset.Asset.DrawableLoadedListener;
 import com.android.wallpaper.config.Flags;
+import com.android.wallpaper.model.Category;
+import com.android.wallpaper.model.CategoryProvider;
+import com.android.wallpaper.model.CategoryReceiver;
 import com.android.wallpaper.model.WallpaperCategory;
 import com.android.wallpaper.model.WallpaperInfo;
 import com.android.wallpaper.model.WallpaperReceiver;
@@ -55,13 +58,11 @@ import com.android.wallpaper.model.WallpaperRotationInitializer;
 import com.android.wallpaper.model.WallpaperRotationInitializer.Listener;
 import com.android.wallpaper.model.WallpaperRotationInitializer.NetworkPreference;
 import com.android.wallpaper.model.WallpaperRotationInitializer.RotationInitializationState;
-import com.android.wallpaper.model.WallpaperRotationInitializer.RotationStateListener;
 import com.android.wallpaper.module.FormFactorChecker;
 import com.android.wallpaper.module.FormFactorChecker.FormFactor;
 import com.android.wallpaper.module.Injector;
 import com.android.wallpaper.module.InjectorProvider;
 import com.android.wallpaper.module.PackageStatusNotifier;
-import com.android.wallpaper.module.RotatingWallpaperComponentChecker;
 import com.android.wallpaper.module.WallpaperChangedNotifier;
 import com.android.wallpaper.module.WallpaperPersister;
 import com.android.wallpaper.module.WallpaperPersister.Destination;
@@ -113,7 +114,6 @@ public class IndividualPickerFragment extends Fragment
 
     WallpaperPreferences mWallpaperPreferences;
     WallpaperChangedNotifier mWallpaperChangedNotifier;
-    RotatingWallpaperComponentChecker mRotatingWallpaperComponentChecker;
     RecyclerView mImageGrid;
     IndividualAdapter mAdapter;
     WallpaperCategory mCategory;
@@ -247,8 +247,6 @@ public class IndividualPickerFragment extends Fragment
         mWallpaperChangedNotifier = WallpaperChangedNotifier.getInstance();
         mWallpaperChangedNotifier.registerListener(mWallpaperChangedListener);
 
-        mRotatingWallpaperComponentChecker = injector.getRotatingWallpaperComponentChecker();
-
         mFormFactor = injector.getFormFactorChecker(appContext).getFormFactor();
 
         mPackageStatusNotifier = injector.getPackageStatusNotifier(appContext);
@@ -257,27 +255,38 @@ public class IndividualPickerFragment extends Fragment
         mRandom = new Random();
         mHandler = new Handler();
 
-        String collectionId = getArguments().getString(ARG_CATEGORY_COLLECTION_ID);
-        mCategory = (WallpaperCategory) injector.getCategoryProvider(appContext).getCategory(
-                collectionId);
-        if (mCategory == null) {
-            DiskBasedLogger.e(TAG, "Failed to find the category.", appContext);
-
-            // The absence of this category in the CategoryProvider indicates a broken state, probably due
-            // to a relaunch into this activity/fragment following a crash immediately prior; see
-            // b//38030129. Hence, finish the activity and return.
-            getActivity().finish();
-            return;
-        }
-
-        mWallpaperRotationInitializer = mCategory.getWallpaperRotationInitializer();
-
         // Clear Glide's cache if night-mode changed to ensure thumbnails are reloaded
         if (savedInstanceState != null && (savedInstanceState.getInt(KEY_NIGHT_MODE)
                 != (getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK))) {
             Glide.get(getContext()).clearMemory();
         }
 
+        CategoryProvider categoryProvider = injector.getCategoryProvider(appContext);
+        categoryProvider.fetchCategories(new CategoryReceiver() {
+            @Override
+            public void onCategoryReceived(Category category) {
+                // Do nothing.
+            }
+
+            @Override
+            public void doneFetchingCategories() {
+                mCategory = (WallpaperCategory) categoryProvider.getCategory(
+                        getArguments().getString(ARG_CATEGORY_COLLECTION_ID));
+                if (mCategory == null) {
+                    DiskBasedLogger.e(TAG, "Failed to find the category.", getContext());
+
+                    // The absence of this category in the CategoryProvider indicates a broken
+                    // state, see b/38030129. Hence, finish the activity and return.
+                    getActivity().finish();
+                    return;
+                }
+                onCategoryLoaded();
+            }
+        }, false);
+    }
+
+    protected void onCategoryLoaded() {
+        mWallpaperRotationInitializer = mCategory.getWallpaperRotationInitializer();
         fetchWallpapers(false);
 
         if (mCategory.supportsThirdParty()) {
@@ -290,6 +299,8 @@ public class IndividualPickerFragment extends Fragment
             mPackageStatusNotifier.addListener(mAppStatusListener,
                     WallpaperService.SERVICE_INTERFACE);
         }
+
+        maybeSetUpImageGrid();
     }
 
     void fetchWallpapers(boolean forceReload) {
@@ -346,7 +357,8 @@ public class IndividualPickerFragment extends Fragment
         }
         GridMarginDecoration.applyTo(mImageGrid);
 
-        setUpImageGrid();
+        maybeSetUpImageGrid();
+
         setUpBottomSheet();
 
         return view;
@@ -369,6 +381,26 @@ public class IndividualPickerFragment extends Fragment
                 gridPaddingPx, gridPaddingPx, 0, paddingBottomPx);
     }
 
+    private void maybeSetUpImageGrid() {
+        // Skip if mImageGrid been initialized yet
+        if (mImageGrid == null) {
+            return;
+        }
+        // Skip if category hasn't loaded yet
+        if (mCategory == null) {
+            return;
+        }
+        // Skip if the adapter was already created
+        if (mAdapter != null) {
+            return;
+        }
+        setUpImageGrid();
+    }
+
+    /**
+     * Create the adapter and assign it to mImageGrid.
+     * Both mImageGrid and mCategory are guaranteed to not be null when this method is called.
+     */
     void setUpImageGrid() {
         mAdapter = new IndividualAdapter(mWallpapers);
         mImageGrid.setAdapter(mAdapter);
@@ -408,7 +440,8 @@ public class IndividualPickerFragment extends Fragment
     public void onResume() {
         super.onResume();
 
-        WallpaperPreferences preferences = InjectorProvider.getInjector().getPreferences(getActivity());
+        WallpaperPreferences preferences = InjectorProvider.getInjector()
+                .getPreferences(getActivity());
         preferences.setLastAppActiveTimestamp(new Date().getTime());
 
         // Reset Glide memory settings to a "normal" level of usage since it may have been lowered in
@@ -504,31 +537,23 @@ public class IndividualPickerFragment extends Fragment
      * state of the user's device and binds the state of the current category's rotation to the "start
      * rotation" tile.
      */
-    private void refreshRotationHolder(final RotationHolder rotationHolder) {
+    private void refreshRotationHolder(RotationHolder rotationHolder) {
         mWallpaperRotationInitializer.fetchRotationInitializationState(getContext(),
-                new RotationStateListener() {
-                    @Override
-                    public void onRotationStateReceived(
-                            @RotationInitializationState final int rotationInitializationState) {
+                rotationState -> {
+                    // Update the UI state of the "start rotation" tile displayed on screen.
+                    // Do this in a Handler so it is scheduled at the end of the message queue.
+                    // This is necessary to ensure we do not remove or add data from the adapter
+                    // while the layout is still being computed. RecyclerView documentation
+                    // therefore recommends performing such changes in a Handler.
+                    new Handler().post(() -> {
+                        // A config change may have destroyed the activity since the refresh
+                        // started, so check for that to avoid an NPE.
+                        if (getActivity() == null) {
+                            return;
+                        }
 
-                        // Update the UI state of the "start rotation" tile displayed on screen. Do this in a
-                        // Handler so it is scheduled at the end of the message queue. This is necessary to
-                        // ensure we do not remove or add data from the adapter while the layout is still being
-                        // computed. RecyclerView documentation therefore recommends performing such changes in
-                        // a Handler.
-                        new android.os.Handler().post(new Runnable() {
-                            @Override
-                            public void run() {
-                                // A config change may have destroyed the activity since the refresh started, so
-                                // check for that to avoid an NPE.
-                                if (getActivity() == null) {
-                                    return;
-                                }
-
-                                rotationHolder.bindRotationInitializationState(rotationInitializationState);
-                            }
-                        });
-                    }
+                        rotationHolder.bindRotationInitializationState(rotationState);
+                    });
                 });
     }
 
@@ -577,34 +602,33 @@ public class IndividualPickerFragment extends Fragment
                         // app before the first wallpaper image in rotation finishes downloading.
                         Activity activity = getActivity();
 
-                        if (activity != null
-                                && mWallpaperRotationInitializer
-                                .isNoBackupImageWallpaperPreviewNeeded(appContext)) {
-                            ((IndividualPickerActivity) activity).showNoBackupImageWallpaperPreview();
-                        } else {
-                            if (mWallpaperRotationInitializer.startRotation(appContext)) {
-                                if (activity != null && mFormFactor == FormFactorChecker.FORM_FACTOR_MOBILE) {
-                                    try {
-                                        Toast.makeText(getActivity(), R.string.wallpaper_set_successfully_message,
-                                                Toast.LENGTH_SHORT).show();
-                                    } catch (NotFoundException e) {
-                                        Log.e(TAG, "Could not show toast " + e);
-                                    }
 
-                                    activity.setResult(Activity.RESULT_OK);
-                                    activity.finish();
-                                } else if (mFormFactor == FormFactorChecker.FORM_FACTOR_DESKTOP) {
-                                    mAdapter.updateSelectedTile(SPECIAL_FIXED_TILE_ADAPTER_POSITION);
+                        if (mWallpaperRotationInitializer.startRotation(appContext)) {
+                            if (activity != null
+                                    && mFormFactor == FormFactorChecker.FORM_FACTOR_MOBILE) {
+                                try {
+                                    Toast.makeText(getActivity(),
+                                            R.string.wallpaper_set_successfully_message,
+                                            Toast.LENGTH_SHORT).show();
+                                } catch (NotFoundException e) {
+                                    Log.e(TAG, "Could not show toast " + e);
                                 }
-                            } else { // Failed to start rotation.
-                                showStartRotationErrorDialog(networkPreference);
 
-                                if (mFormFactor == FormFactorChecker.FORM_FACTOR_DESKTOP) {
-                                    DesktopRotationHolder rotationViewHolder =
-                                            (DesktopRotationHolder) mImageGrid.findViewHolderForAdapterPosition(
-                                                    SPECIAL_FIXED_TILE_ADAPTER_POSITION);
-                                    rotationViewHolder.setSelectionState(SelectableHolder.SELECTION_STATE_DESELECTED);
-                                }
+                                activity.setResult(Activity.RESULT_OK);
+                                activity.finish();
+                            } else if (mFormFactor == FormFactorChecker.FORM_FACTOR_DESKTOP) {
+                                mAdapter.updateSelectedTile(SPECIAL_FIXED_TILE_ADAPTER_POSITION);
+                            }
+                        } else { // Failed to start rotation.
+                            showStartRotationErrorDialog(networkPreference);
+
+                            if (mFormFactor == FormFactorChecker.FORM_FACTOR_DESKTOP) {
+                                DesktopRotationHolder rotationViewHolder =
+                                        (DesktopRotationHolder)
+                                                mImageGrid.findViewHolderForAdapterPosition(
+                                                SPECIAL_FIXED_TILE_ADAPTER_POSITION);
+                                rotationViewHolder.setSelectionState(
+                                        SelectableHolder.SELECTION_STATE_DESELECTED);
                             }
                         }
                     }
@@ -653,11 +677,7 @@ public class IndividualPickerFragment extends Fragment
      * Returns whether rotation is enabled for this category.
      */
     boolean isRotationEnabled() {
-        boolean isRotationSupported =
-                mRotatingWallpaperComponentChecker.getRotatingWallpaperSupport(getContext())
-                        == RotatingWallpaperComponentChecker.ROTATING_WALLPAPER_SUPPORT_SUPPORTED;
-
-        return isRotationSupported && mWallpaperRotationInitializer != null;
+        return mWallpaperRotationInitializer != null;
     }
 
     @Override
@@ -695,10 +715,10 @@ public class IndividualPickerFragment extends Fragment
             super(itemView);
             itemView.setOnClickListener(this);
 
-            mTileLayout = (FrameLayout) itemView.findViewById(R.id.daily_refresh);
-            mRotationMessage = (TextView) itemView.findViewById(R.id.rotation_tile_message);
-            mRotationTitle = (TextView) itemView.findViewById(R.id.rotation_tile_title);
-            mRefreshIcon = (ImageView) itemView.findViewById(R.id.rotation_tile_refresh_icon);
+            mTileLayout = itemView.findViewById(R.id.daily_refresh);
+            mRotationMessage = itemView.findViewById(R.id.rotation_tile_message);
+            mRotationTitle = itemView.findViewById(R.id.rotation_tile_title);
+            mRefreshIcon = itemView.findViewById(R.id.rotation_tile_refresh_icon);
             mTileLayout.getLayoutParams().height = mTileSizePx.y;
 
             // If the feature flag for "dynamic start rotation tile" is not enabled, fall back to the
@@ -712,7 +732,8 @@ public class IndividualPickerFragment extends Fragment
                 mRotationMessage.setTextColor(
                         getResources().getColor(R.color.rotation_tile_enabled_subtitle_text_color));
                 mRefreshIcon.setColorFilter(
-                        getResources().getColor(R.color.rotation_tile_enabled_refresh_icon_color), Mode.SRC_IN);
+                        getResources().getColor(R.color.rotation_tile_enabled_refresh_icon_color),
+                        Mode.SRC_IN);
                 return;
             }
 
@@ -728,10 +749,7 @@ public class IndividualPickerFragment extends Fragment
 
         @Override
         public void onClick(View v) {
-            boolean isLiveWallpaperNeeded = mWallpaperRotationInitializer
-                    .isNoBackupImageWallpaperPreviewNeeded(getActivity().getApplicationContext());
-            DialogFragment startRotationDialogFragment = StartRotationDialogFragment
-                    .newInstance(isLiveWallpaperNeeded);
+            DialogFragment startRotationDialogFragment = new StartRotationDialogFragment();
             startRotationDialogFragment.setTargetFragment(
                     IndividualPickerFragment.this, UNUSED_REQUEST_CODE);
             startRotationDialogFragment.show(getFragmentManager(), TAG_START_ROTATION_DIALOG);

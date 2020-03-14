@@ -16,15 +16,10 @@
 package com.android.wallpaper.picker.individual;
 
 import android.app.Activity;
-import android.app.WallpaperManager;
-import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.res.Resources.NotFoundException;
 import android.graphics.Insets;
-import android.graphics.PorterDuff.Mode;
-import android.graphics.drawable.Drawable;
-import android.os.Build.VERSION;
 import android.os.Bundle;
 import android.util.Log;
 import android.view.MenuItem;
@@ -33,25 +28,23 @@ import android.view.WindowInsets;
 import android.widget.Toast;
 
 import androidx.appcompat.widget.Toolbar;
-import androidx.core.content.ContextCompat;
 import androidx.fragment.app.Fragment;
 import androidx.fragment.app.FragmentManager;
 
 import com.android.wallpaper.R;
 import com.android.wallpaper.compat.BuildCompat;
 import com.android.wallpaper.model.Category;
+import com.android.wallpaper.model.CategoryProvider;
+import com.android.wallpaper.model.CategoryReceiver;
 import com.android.wallpaper.model.InlinePreviewIntentFactory;
 import com.android.wallpaper.model.LiveWallpaperInfo;
 import com.android.wallpaper.model.PickerIntentFactory;
 import com.android.wallpaper.model.WallpaperInfo;
 import com.android.wallpaper.module.Injector;
 import com.android.wallpaper.module.InjectorProvider;
-import com.android.wallpaper.module.LiveWallpaperStatusChecker;
-import com.android.wallpaper.module.NoBackupImageWallpaper;
 import com.android.wallpaper.module.WallpaperPersister;
 import com.android.wallpaper.picker.BaseActivity;
 import com.android.wallpaper.picker.PreviewActivity.PreviewActivityIntentFactory;
-import com.android.wallpaper.util.ActivityUtils;
 import com.android.wallpaper.util.DiskBasedLogger;
 
 /**
@@ -63,13 +56,11 @@ public class IndividualPickerActivity extends BaseActivity {
     private static final String EXTRA_CATEGORY_COLLECTION_ID =
             "com.android.wallpaper.category_collection_id";
     private static final int PREVIEW_WALLPAPER_REQUEST_CODE = 0;
-    private static final int NO_BACKUP_IMAGE_WALLPAPER_REQUEST_CODE = 1;
     private static final int PREVIEW_LIVEWALLPAPER_REQUEST_CODE = 2;
     private static final String KEY_CATEGORY_COLLECTION_ID = "key_category_collection_id";
 
     private InlinePreviewIntentFactory mPreviewIntentFactory;
     private WallpaperPersister mWallpaperPersister;
-    private LiveWallpaperStatusChecker mLiveWallpaperStatusChecker;
     private Category mCategory;
     private String mCategoryCollectionId;
 
@@ -85,7 +76,6 @@ public class IndividualPickerActivity extends BaseActivity {
         mPreviewIntentFactory = new PreviewActivityIntentFactory();
         Injector injector = InjectorProvider.getInjector();
         mWallpaperPersister = injector.getWallpaperPersister(this);
-        mLiveWallpaperStatusChecker = injector.getLiveWallpaperStatusChecker(this);
 
         FragmentManager fm = getSupportFragmentManager();
         Fragment fragment = fm.findFragmentById(R.id.fragment_container);
@@ -93,18 +83,29 @@ public class IndividualPickerActivity extends BaseActivity {
         mCategoryCollectionId = (savedInstanceState == null)
                 ? getIntent().getStringExtra(EXTRA_CATEGORY_COLLECTION_ID)
                 : savedInstanceState.getString(KEY_CATEGORY_COLLECTION_ID);
-        mCategory = injector.getCategoryProvider(this).getCategory(mCategoryCollectionId);
-        if (mCategory == null) {
-            DiskBasedLogger.e(TAG, "Failed to find the category: " + mCategoryCollectionId, this);
-            // We either were called with an invalid collection Id, or we're restarting with no
-            // saved state, or with a collection id that doesn't exist anymore.
-            // In those cases, we cannot continue, so let's just go back.
-            finish();
-            return;
-        }
+        CategoryProvider categoryProvider = injector.getCategoryProvider(this);
+        categoryProvider.fetchCategories(new CategoryReceiver() {
+            @Override
+            public void onCategoryReceived(Category category) {
+                // Do nothing.
+            }
 
-        setTitle(mCategory.getTitle());
-        getSupportActionBar().setTitle(mCategory.getTitle());
+            @Override
+            public void doneFetchingCategories() {
+                mCategory = categoryProvider.getCategory(mCategoryCollectionId);
+                if (mCategory == null) {
+                    DiskBasedLogger.e(TAG, "Failed to find the category: " + mCategoryCollectionId,
+                            IndividualPickerActivity.this);
+                    // We either were called with an invalid collection Id, or we're restarting with
+                    // no saved state, or with a collection id that doesn't exist anymore.
+                    // In those cases, we cannot continue, so let's just go back.
+                    finish();
+                    return;
+                }
+                onCategoryLoaded();
+            }
+        }, false);
+
         getSupportActionBar().setDisplayHomeAsUpEnabled(true);
 
         toolbar.getNavigationIcon().setTint(getColor(R.color.toolbar_icon_color));
@@ -142,12 +143,17 @@ public class IndividualPickerActivity extends BaseActivity {
         }
     }
 
+    private void onCategoryLoaded() {
+        setTitle(mCategory.getTitle());
+        getSupportActionBar().setTitle(mCategory.getTitle());
+    }
+
     @Override
     public boolean onOptionsItemSelected(MenuItem item) {
         int id = item.getItemId();
         if (id == android.R.id.home) {
-            // Handle Up as a Global back since the only entry point to IndividualPickerActivity is from
-            // TopLevelPickerActivity.
+            // Handle Up as a Global back since the only entry point to IndividualPickerActivity is
+            // from TopLevelPickerActivity.
             onBackPressed();
             return true;
         }
@@ -170,18 +176,6 @@ public class IndividualPickerActivity extends BaseActivity {
                     finishWithResultOk(shouldShowMessage);
                 }
                 break;
-
-            case NO_BACKUP_IMAGE_WALLPAPER_REQUEST_CODE:
-                // User clicked "Set wallpaper" in live wallpaper preview UI.
-                // NOTE: Don't check for the result code prior to KitKat MR2 because a bug on those versions
-                // caused the result code to be discarded from LivePicker so we can't rely on it.
-                if ((!BuildCompat.isAtLeastL() || resultCode == Activity.RESULT_OK)
-                        && mLiveWallpaperStatusChecker.isNoBackupImageWallpaperSet()
-                        && mCategory.getWallpaperRotationInitializer().startRotation(getApplicationContext())) {
-                    finishWithResultOk(true);
-                }
-                break;
-
             default:
                 Log.e(TAG, "Invalid request code: " + requestCode);
         }
@@ -195,18 +189,6 @@ public class IndividualPickerActivity extends BaseActivity {
         wallpaperInfo.showPreview(this, mPreviewIntentFactory,
                 wallpaperInfo instanceof LiveWallpaperInfo ? PREVIEW_LIVEWALLPAPER_REQUEST_CODE
                         : PREVIEW_WALLPAPER_REQUEST_CODE);
-    }
-
-    /**
-     * Shows the system live wallpaper preview for the {@link NoBackupImageWallpaper} which is used to
-     * draw rotating wallpapers on pre-N Android builds.
-     */
-    public void showNoBackupImageWallpaperPreview() {
-        Intent intent = new Intent(WallpaperManager.ACTION_CHANGE_LIVE_WALLPAPER);
-        ComponentName componentName = new ComponentName(this, NoBackupImageWallpaper.class);
-        intent.putExtra(WallpaperManager.EXTRA_LIVE_WALLPAPER_COMPONENT, componentName);
-        ActivityUtils.startActivityForResultSafely(
-                this, intent, NO_BACKUP_IMAGE_WALLPAPER_REQUEST_CODE);
     }
 
     private void finishWithResultOk(boolean shouldShowMessage) {
